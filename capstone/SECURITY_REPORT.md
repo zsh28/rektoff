@@ -1,7 +1,5 @@
-# MetaLend Security Audit Report
+# MetaLend Security Audit Report by Zeesh
 
-**Audit Date**: December 2025  
-**Auditor**: Security Analyst  
 **Protocol**: MetaLend Lending Protocol  
 **Solana Program ID**: AYye92emHVPgnxDHnTEkuuWVLUKF7JHKgWsXysZBZ3qe
 
@@ -29,12 +27,6 @@ This report presents a comprehensive security audit of the MetaLend lending prot
 ```bash
 # Run all tests including exploits
 anchor test
-
-# Run only exploit tests
-anchor test -- --grep "EXPLOIT"
-
-# View detailed exploit output
-anchor test 2>&1 | grep -A 50 "EXPLOIT"
 ```
 
 ---
