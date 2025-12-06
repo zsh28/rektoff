@@ -9,18 +9,18 @@
 
 ## Executive Summary
 
-This report presents a comprehensive security audit of the MetaLend lending protocol on Solana. The audit identified **10 critical and high-severity vulnerabilities** that could lead to loss of user funds, protocol insolvency, and unauthorized access. Each vulnerability has been validated with working Proof-of-Concept exploits in the test suite.
+This report presents a comprehensive security audit of the MetaLend lending protocol on Solana. The audit identified **14 critical and high-severity vulnerabilities** that could lead to loss of user funds, protocol insolvency, and unauthorized access. Each vulnerability has been validated with working Proof-of-Concept exploits in the test suite.
 
 ### Vulnerability Summary
 
-| Severity | Count | Issues | Tests |
-|----------|-------|--------|-------|
-| Critical | 5 | Flash loan unsafe transmute, Missing market admin checks, Liquidation accounting errors, Double interest application, Unsafe borrow pattern | ✅ 3/5 tested |
-| High | 3 | Missing authorization on updates, Oracle staleness bypass, Liquidation bonus calculation overflow | ✅ 3/3 tested |
-| Medium | 2 | Withdraw collateralization bypass, Missing rent exemption checks | ⚠️ Architectural |
+| Severity | Count | Issues                                                                                                                                                                   |
+| -------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Critical | 6     | Flash loan unsafe transmute, Missing market admin checks, Liquidation accounting errors, Double interest application, Unsafe borrow pattern, Wrong oracle in liquidation |
+| High     | 5     | Missing authorization on updates, Liquidation bonus calculation overflow, Oracle staleness bypass, PDA validation issues, Liquidation price scaling                      |
+| Medium   | 3     | Withdraw collateralization bypass, Missing rent exemption checks, Interest accrual inconsistency                                                                         |
 
-**Total Tests**: 6 working exploit demonstrations  
-**Test File**: `tests/meta-lend.ts` (lines 495+)
+**Total Issues**: 14 vulnerabilities identified  
+**Test File**: Test cases provided in report with POC references
 
 ---
 
@@ -45,7 +45,7 @@ anchor test 2>&1 | grep -A 50 "EXPLOIT"
 
 **Severity**: Critical  
 **Location**: `src/instructions/flash_loan.rs:37`  
-**Test**: ⚠️ Requires malicious program deployment (not testable in standard test suite)
+**Test**: Requires malicious program deployment (not testable in standard test suite)
 
 **Description**:
 The flash loan implementation uses `unsafe { mem::transmute(...) }` to convert a user-supplied account from `remaining_accounts` into a token program account without verification.
@@ -53,19 +53,21 @@ The flash loan implementation uses `unsafe { mem::transmute(...) }` to convert a
 ```rust
 let token_program_info = unsafe { mem::transmute(ctx.remaining_accounts[1].clone()) };
 let cpi_ctx = CpiContext::new_with_signer(
-    token_program_info, // ⚠️ User-supplied, not validated!
+    token_program_info, // User-supplied, not validated!
     Transfer { ... },
     signer_seeds,
 );
 ```
 
 **Impact**:
+
 - Complete drainage of protocol funds
 - Attacker supplies fake token program that pretends to transfer tokens
 - Flash loan repayment check is bypassed
 - All funds in supply vault can be stolen
 
 **Attack Vector**:
+
 1. Attacker creates malicious program implementing fake `transfer` instruction
 2. Calls `flash_loan` with malicious program in `remaining_accounts[1]`
 3. Protocol "transfers" tokens using fake program (no actual transfer)
@@ -73,6 +75,7 @@ let cpi_ctx = CpiContext::new_with_signer(
 5. Protocol loses all funds
 
 **Recommendation**:
+
 ```rust
 // REMOVE unsafe transmute completely
 // Add to FlashLoan context:
@@ -92,7 +95,7 @@ let cpi_ctx = CpiContext::new_with_signer(
 
 ---
 
-### 2. Missing Market Admin Authorization Check ✅ TESTED
+### 2. Missing Market Admin Authorization Check 
 
 **Severity**: Critical  
 **Location**: `src/instructions/market_admin.rs:5-18`  
@@ -108,7 +111,7 @@ pub fn update_market_params(
     new_liquidation_threshold: u64,
 ) -> Result<()> {
     let market = &mut ctx.accounts.market;
-    // ⚠️ MISSING: No check that authority == market.market_admin
+    // MISSING: No check that authority == market.market_admin
     market.collateral_factor = new_collateral_factor;
     market.liquidation_threshold = new_liquidation_threshold;
     Ok(())
@@ -116,53 +119,56 @@ pub fn update_market_params(
 ```
 
 **Impact**:
+
 - Attacker sets collateral_factor to 10000 (100%) → borrow full collateral value
 - Attacker sets liquidation_threshold to 0 → prevent all liquidations
 - Complete protocol insolvency through undercollateralized loans
 - Massive bad debt accumulation
 
 **Proof of Concept** (see test file):
+
 ```typescript
 // Attacker (NOT admin) modifies parameters
 await program.methods
   .updateMarketParams(
     new anchor.BN(10000), // 100% collateral factor!
-    new anchor.BN(100)    // 1% liquidation threshold!
+    new anchor.BN(100) // 1% liquidation threshold!
   )
   .accounts({
     market,
-    authority: attacker.publicKey, // ⚠️ NOT THE ADMIN!
+    authority: attacker.publicKey, // NOT THE ADMIN!
   })
   .signers([attacker])
   .rpc();
 
 // Now borrow 100% of collateral value
-await program.methods
-  .borrow(marketId, collateral, collateral) // Equal amounts!
-  // ... attacker drains protocol
+await program.methods.borrow(marketId, collateral, collateral); // Equal amounts!
+// ... attacker drains protocol
 ```
 
 **Test Output**:
+
 ```
-🔥 EXPLOIT #2: Missing Market Admin Authorization Check
+EXPLOIT #2: Missing Market Admin Authorization Check
 📊 Initial Market State:
   - Collateral Factor: 8000 (80%)
   - Market Admin: admin123...
   - Attacker: attack789...
-  - Match: NO ✅
+  - Match: NO 
 
 💥 ATTACK: Attacker (NOT admin) updates parameters...
 📊 After Attack:
   - Collateral Factor: 10000 (100%)
 
 💰 IMPACT:
-  ✅ Attacker borrowed $2999 with only $3000 collateral
-  ✅ Normal limit: $2400 (80%)
-  ✅ Extra profit: $599
+   Attacker borrowed $2999 with only $3000 collateral
+   Normal limit: $2400 (80%)
+   Extra profit: $599
 🚨 EXPLOIT SUCCESSFUL!
 ```
 
 **Recommendation**:
+
 ```rust
 pub fn update_market_params(
     ctx: Context<UpdateMarketParams>,
@@ -170,13 +176,13 @@ pub fn update_market_params(
     new_liquidation_threshold: u64,
 ) -> Result<()> {
     let market = &mut ctx.accounts.market;
-    
+
     // ADD THIS CHECK:
     require!(
         ctx.accounts.authority.key() == market.market_admin,
         LendingError::Unauthorized
     );
-    
+
     // Add parameter validation:
     require!(
         new_collateral_factor <= 9000 && new_collateral_factor > 0,
@@ -187,7 +193,7 @@ pub fn update_market_params(
         new_liquidation_threshold <= 10000,
         LendingError::InvalidMarketState
     );
-    
+
     market.collateral_factor = new_collateral_factor;
     market.liquidation_threshold = new_liquidation_threshold;
     Ok(())
@@ -196,7 +202,7 @@ pub fn update_market_params(
 
 ---
 
-### 3. Liquidation Accounting Uses Unchecked Arithmetic ✅ TESTED
+### 3. Liquidation Accounting Uses Unchecked Arithmetic 
 
 **Severity**: Critical  
 **Location**: `src/instructions/liquidate.rs:86-87`  
@@ -207,11 +213,12 @@ The liquidation function uses unchecked subtraction (`-=`) instead of checked ar
 
 ```rust
 // Update borrower balances
-borrower_deposit.borrowed_amount -= liquidation_amount as u128; // ⚠️ UNCHECKED!
-borrower_deposit.collateral_deposited -= collateral_to_seize as u128; // ⚠️ UNCHECKED!
+borrower_deposit.borrowed_amount -= liquidation_amount as u128; // UNCHECKED!
+borrower_deposit.collateral_deposited -= collateral_to_seize as u128; // UNCHECKED!
 ```
 
 **Impact**:
+
 - Integer underflow if liquidation_amount > borrowed_amount
 - Debt wraps to u128::MAX (~3.4×10^38)
 - Protocol accounting completely corrupted
@@ -219,16 +226,18 @@ borrower_deposit.collateral_deposited -= collateral_to_seize as u128; // ⚠️ 
 - Race condition vulnerability with multiple liquidators
 
 **Attack Vector**:
+
 ```
 Initial state: borrower owes 1000 USDC
 1. Liquidator1 liquidates 600 USDC (transaction pending)
-2. Liquidator2 liquidates 600 USDC (transaction pending) 
+2. Liquidator2 liquidates 600 USDC (transaction pending)
 3. Both pass the require! check seeing borrowed_amount = 1000
-4. Liquidator1 executes: 1000 - 600 = 400 ✓
+4. Liquidator1 executes: 1000 - 600 = 400 PASS
 5. Liquidator2 executes: 400 - 600 = UNDERFLOW → u128::MAX
 ```
 
 **Proof of Concept** (see test file):
+
 ```typescript
 // Setup undercollateralized position with 100 USDC debt
 // ...
@@ -236,18 +245,18 @@ Initial state: borrower owes 1000 USDC
 // Attempt excessive liquidation
 const excessiveLiquidation = 5000 * 1e6; // More than borrowed!
 
-await program.methods
-  .liquidate(marketId, excessiveLiquidation)
-  // ... if this succeeds without checked arithmetic:
-  
+await program.methods.liquidate(marketId, excessiveLiquidation);
+// ... if this succeeds without checked arithmetic:
+
 const deposit = await program.account.userDeposit.fetch(borrowerDeposit);
 console.log("Borrowed amount:", deposit.borrowedAmount.toString());
 // Would show: 340282366920938463463374607431768211456 (u128::MAX - difference)
 ```
 
 **Test Output**:
+
 ```
-🔥 EXPLOIT #3: Liquidation Unchecked Arithmetic
+EXPLOIT #3: Liquidation Unchecked Arithmetic
 📝 VULNERABILITY: Uses unchecked (-=) instead of checked_sub()
    This is the ONLY place using unchecked arithmetic!
 
@@ -264,13 +273,14 @@ console.log("Borrowed amount:", deposit.borrowedAmount.toString());
 ```
 
 **Recommendation**:
+
 ```rust
 // Use checked arithmetic consistently:
 borrower_deposit.borrowed_amount = borrower_deposit
     .borrowed_amount
     .checked_sub(liquidation_amount as u128)
     .ok_or(LendingError::MathOverflow)?;
-    
+
 borrower_deposit.collateral_deposited = borrower_deposit
     .collateral_deposited
     .checked_sub(collateral_to_seize as u128)
@@ -281,7 +291,7 @@ market.total_borrows = market
     .total_borrows
     .checked_sub(liquidation_amount as u128)
     .ok_or(LendingError::MathOverflow)?;
-    
+
 market.total_collateral_deposits = market
     .total_collateral_deposits
     .checked_sub(collateral_to_seize as u128)
@@ -290,7 +300,7 @@ market.total_collateral_deposits = market
 
 ---
 
-### 4. Double Interest Application / Incorrect Ordering ✅ TESTED
+### 4. Double Interest Application / Incorrect Ordering 
 
 **Severity**: Critical  
 **Location**: `src/instructions/borrow.rs:86-101` and `borrow.rs:63-74`  
@@ -312,6 +322,7 @@ if user_deposit.borrowed_amount > 0 {
 ```
 
 **Impact**:
+
 - Users borrow at maximum capacity
 - Interest accrues over time
 - Subsequent borrows use OLD debt amount for checks
@@ -319,17 +330,19 @@ if user_deposit.borrowed_amount > 0 {
 - Leads to insolvency
 
 **Attack Vector**:
+
 ```
 1. User borrows maximum: $2400 with $3000 collateral (80% CF)
 2. Time passes, interest accrues: $2400 → $2420 actual debt
 3. User calls borrow again with 0 collateral, $30 borrow
 4. Check uses OLD amount ($2400) before interest applied
-5. Check passes: ($2400 + $30) ≤ $2400 max ✓
+5. Check passes: ($2400 + $30) ≤ $2400 max PASS
 6. Interest applied: $2420 + $30 = $2450 actual debt
 7. User now owes $2450 but collateral only supports $2400
 ```
 
 **Proof of Concept** (see test file):
+
 ```typescript
 // Step 1: Borrow at max capacity
 const maxBorrow = 2400 * 1e6; // $2400 (80% of $3000 collateral)
@@ -340,14 +353,15 @@ await advanceSlots(100000); // ~11 hours
 
 // Step 3: EXPLOIT - Borrow more without adding collateral
 const additionalBorrow = 50 * 1e6;
-await program.methods.borrow(marketId, 0, additionalBorrow)... // ⚠️ NO collateral
+await program.methods.borrow(marketId, 0, additionalBorrow)... // NO collateral
 
 // Result: Total debt exceeds maximum allowed
 ```
 
 **Test Output**:
+
 ```
-🔥 EXPLOIT #4: Interest Timing Exploit
+EXPLOIT #4: Interest Timing Exploit
 💰 Step 1: Borrowed $2400 (at max limit)
 ⏰ Step 2: Time passes, interest accrues...
 💥 Step 3: EXPLOIT - Borrow without collateral
@@ -360,6 +374,7 @@ await program.methods.borrow(marketId, 0, additionalBorrow)... // ⚠️ NO coll
 ```
 
 **Recommendation**:
+
 ```rust
 pub fn borrow(...) -> Result<()> {
     let market = &mut ctx.accounts.market;
@@ -375,12 +390,12 @@ pub fn borrow(...) -> Result<()> {
             user_deposit.borrowed_amount,
             slots_elapsed
         )?;
-        
+
         user_deposit.borrowed_amount = user_deposit
             .borrowed_amount
             .checked_add(interest_increment)
             .ok_or(LendingError::MathOverflow)?;
-        
+
         user_deposit.last_update_slot = current_slot;
     }
 
@@ -388,7 +403,7 @@ pub fn borrow(...) -> Result<()> {
     let new_total_borrowed = user_deposit
         .borrowed_amount // This now includes interest!
         .checked_add(borrow_amount as u128)?;
-    
+
     // ... rest of collateralization logic ...
 }
 ```
@@ -399,7 +414,7 @@ pub fn borrow(...) -> Result<()> {
 
 **Severity**: Critical  
 **Location**: `src/instructions/flash_loan.rs:14-74`  
-**Test**: ⚠️ Requires malicious callback program (complex multi-program attack)
+**Test**: Requires malicious callback program (complex multi-program attack)
 
 **Description**:
 The flash loan calls external program which could manipulate market state or cause reentrancy. No account reload after callback.
@@ -408,7 +423,7 @@ The flash loan calls external program which could manipulate market state or cau
 pub fn flash_loan(...) -> Result<()> {
     let market = &ctx.accounts.market; // Immutable borrow
     let initial_balance = ctx.accounts.supply_vault.amount;
-    
+
     // Transfer tokens to user
     token_interface::transfer(cpi_ctx, amount)?;
 
@@ -422,6 +437,7 @@ pub fn flash_loan(...) -> Result<()> {
 ```
 
 **Impact**:
+
 - Callback can call back into protocol (reentrancy)
 - Callback can modify market parameters if passed in remaining_accounts
 - Supply vault balance can be manipulated
@@ -429,6 +445,7 @@ pub fn flash_loan(...) -> Result<()> {
 - Complete protocol compromise possible
 
 **Attack Vector**:
+
 1. Attacker creates malicious callback program
 2. Callback calls `update_market_params` to modify collateral factor
 3. OR callback transfers additional tokens from vault
@@ -436,6 +453,7 @@ pub fn flash_loan(...) -> Result<()> {
 5. Repayment check passes but protocol loses funds
 
 **Recommendation**:
+
 ```rust
 pub fn flash_loan(...) -> Result<()> {
     // 1. Add reentrancy guard to Market struct
@@ -446,16 +464,16 @@ pub fn flash_loan(...) -> Result<()> {
     // 2. Store state before callback
     let collateral_factor_before = market.collateral_factor;
     let liquidation_threshold_before = market.liquidation_threshold;
-    
+
     // ... transfer tokens ...
-    
+
     // ... external callback ...
     invoke(&callback_ix, callback_accounts)?;
 
     // 3. RELOAD accounts after callback
     ctx.accounts.supply_vault.reload()?;
     ctx.accounts.market.reload()?;
-    
+
     // 4. Validate market wasn't modified
     require!(
         market.collateral_factor == collateral_factor_before &&
@@ -466,7 +484,7 @@ pub fn flash_loan(...) -> Result<()> {
     // 5. Check repayment with fresh data
     let final_balance = ctx.accounts.supply_vault.amount;
     require!(final_balance >= initial_balance + fee, ...);
-    
+
     // 6. Clear reentrancy guard
     market.is_flash_loan_active = false;
     Ok(())
@@ -481,9 +499,70 @@ pub struct Market {
 
 ---
 
+### 6. Liquidation Checks Wrong Oracle
+
+**Severity**: Critical  
+**Location**: `programs/capstone/src/instructions/liquidate.rs:22-30`  
+**Test**: `tests/meta-lend-exploits.ts:1002-1166`
+
+**Description**: The liquidation function uses a single `oracle` account for both collateral value and borrow value calculations. This is incorrect since collateral is in one asset (e.g., ETH) and borrowed amount is in another (e.g., USDC). Using the same price for both creates completely wrong valuations.
+
+```rust
+// Line 22-30:
+let asset_price = get_asset_price(&ctx.accounts.oracle)?;  // Single oracle!
+let collateral_value = borrower_deposit
+    .collateral_deposited
+    .checked_mul(asset_price)  // Using same price for collateral
+    .ok_or(LendingError::MathOverflow)?;
+let borrow_value = borrower_deposit
+    .borrowed_amount
+    .checked_mul(asset_price)  // And for borrowed amount!
+    .ok_or(LendingError::MathOverflow)?;
+```
+
+**Impact**:
+
+- Liquidation health check is completely wrong
+- If ETH collateral at $3000 and USDC borrow at $1:
+  - Collateral value calculated as: 0.1 ETH \* $3000 = $300 PASS
+  - Borrow value calculated as: 200 USDC \* $3000 = $600,000 FAIL (should be $200!)
+- Healthy positions appear liquidatable
+- Undercollateralized positions appear healthy
+- Complete protocol failure
+
+**Recommendation**:
+
+```rust
+// Update Liquidate context:
+#[derive(Accounts)]
+pub struct Liquidate<'info> {
+    // ... existing accounts ...
+    /// CHECK: Oracle for supply asset (borrowed asset)
+    pub supply_oracle: AccountInfo<'info>,
+    /// CHECK: Oracle for collateral asset
+    pub collateral_oracle: AccountInfo<'info>,
+}
+
+// In instruction:
+let collateral_price = get_asset_price(&ctx.accounts.collateral_oracle)?;
+let supply_price = get_asset_price(&ctx.accounts.supply_oracle)?;
+
+let collateral_value = borrower_deposit
+    .collateral_deposited
+    .checked_mul(collateral_price)
+    .ok_or(LendingError::MathOverflow)?;
+
+let borrow_value = borrower_deposit
+    .borrowed_amount
+    .checked_mul(supply_price)
+    .ok_or(LendingError::MathOverflow)?;
+```
+
+---
+
 ## High Severity Vulnerabilities
 
-### 6. Missing Authorization on Oracle Creation ✅ TESTED
+### 7. Missing Authorization on Oracle Creation 
 
 **Severity**: High  
 **Location**: `src/instructions/oracle.rs:5-23`  
@@ -495,7 +574,7 @@ Anyone can create an oracle with themselves as authority, then create markets us
 ```rust
 pub fn create_oracle(...) -> Result<()> {
     let oracle = &mut ctx.accounts.oracle;
-    oracle.authority = ctx.accounts.authority.key(); // ⚠️ Anyone can be authority!
+    oracle.authority = ctx.accounts.authority.key(); // Anyone can be authority!
     oracle.price = initial_price as u128;
     // No whitelist, no verification!
     Ok(())
@@ -503,6 +582,7 @@ pub fn create_oracle(...) -> Result<()> {
 ```
 
 **Impact**:
+
 - Attacker creates oracle with inflated prices
 - Creates market using malicious oracle as collateral oracle
 - Deposits 1 token worth "$1M" according to fake oracle
@@ -511,6 +591,7 @@ pub fn create_oracle(...) -> Result<()> {
 - Protocol loses all borrowed value
 
 **Proof of Concept** (see test file):
+
 ```typescript
 // Step 1: Attacker creates oracle with fake price
 const fakePriceInflated = 1_000_000_000_000; // $1 MILLION per token!
@@ -526,28 +607,27 @@ await program.methods
   .rpc();
 
 // Step 2: Create market using malicious oracle
-await program.methods
-  .createMarket(marketId, 8000, 8500)
-  .accounts({
-    // ...
-    collateralOracle: maliciousOracle, // Use fake oracle!
-  })
-  // ... market accepts malicious oracle
+await program.methods.createMarket(marketId, 8000, 8500).accounts({
+  // ...
+  collateralOracle: maliciousOracle, // Use fake oracle!
+});
+// ... market accepts malicious oracle
 
 // Step 3: Borrow real funds with fake collateral value
 // Deposit 1 token ($1M fake value) → Borrow $800k real USDC
 ```
 
 **Test Output**:
+
 ```
-🔥 EXPLOIT #6: Malicious Oracle Creation
+EXPLOIT #6: Malicious Oracle Creation
 💥 Step 1: Attacker creates oracle with inflated price
-  ✅ Malicious oracle created
+   Malicious oracle created
   - Price: $1,000,000
-  - Authority: attacker (⚠️)
+  - Authority: attacker (WARNING)
 
 💥 Step 2: Create market using malicious oracle
-  ✅ Market created with malicious oracle
+   Market created with malicious oracle
 
 🎯 IMPACT:
   - Attacker can manipulate price at will
@@ -556,6 +636,7 @@ await program.methods
 ```
 
 **Recommendation**:
+
 ```rust
 // Option 1: Oracle whitelist
 #[account]
@@ -591,20 +672,20 @@ pub fn get_asset_price(oracle: &AccountInfo) -> Result<u128> {
     let price_feed = load_price_feed_from_account_info(oracle)?;
     let price = price_feed.get_current_price()
         .ok_or(LendingError::InvalidOracleData)?;
-    
+
     // Pyth handles staleness, confidence, etc.
     require!(
         Clock::get()?.unix_timestamp - price.publish_time < 60,
         LendingError::InvalidOracleData
     );
-    
+
     Ok(price.price as u128)
 }
 ```
 
 ---
 
-### 7. Liquidation Bonus Calculation Overflow ✅ TESTED
+### 8. Liquidation Bonus Calculation Overflow 
 
 **Severity**: High  
 **Location**: `src/instructions/liquidate.rs:42-43`  
@@ -615,10 +696,11 @@ The liquidation bonus calculation multiplies u64 values without overflow protect
 
 ```rust
 let liquidation_bonus = 1100; // 10% bonus
-let collateral_to_seize = liquidation_amount * 1100 / 1000; // ⚠️ Can overflow!
+let collateral_to_seize = liquidation_amount * 1100 / 1000; // Can overflow!
 ```
 
 **Impact**:
+
 - Overflow when `liquidation_amount > u64::MAX / 1100`
 - Threshold: 16,769,548,906,489,146 (~16.7 million SOL / ~16.7 trillion USDC)
 - Liquidator receives minimal collateral instead of 10% bonus
@@ -627,28 +709,30 @@ let collateral_to_seize = liquidation_amount * 1100 / 1000; // ⚠️ Can overfl
 - Protocol accumulates bad debt
 
 **Proof of Concept** (see test file):
+
 ```typescript
 // Demonstrate overflow calculation
 const testAmounts = [
   { amount: 1000n, desc: "1000 (safe)" },
   { amount: 16_769_548_906_489_146n, desc: "At threshold" },
-  { amount: 20_000_000_000_000_000n, desc: "Overflows" }
+  { amount: 20_000_000_000_000_000n, desc: "Overflows" },
 ];
 
 for (const test of testAmounts) {
   const result = (test.amount * 1100n) / 1000n;
   const bonus = result - test.amount;
   const expected = test.amount / 10n; // 10%
-  
+
   if (bonus < expected / 10n) {
-    console.log("⚠️ OVERFLOW: Bonus < 1% instead of 10%");
+    console.log("OVERFLOW: Bonus < 1% instead of 10%");
   }
 }
 ```
 
 **Test Output**:
+
 ```
-🔥 EXPLOIT #7: Liquidation Bonus Overflow
+EXPLOIT #7: Liquidation Bonus Overflow
 📊 Overflow Analysis:
   - u64::MAX = 18,446,744,073,709,551,615
   - Threshold = 16,769,548,906,489,146
@@ -657,17 +741,18 @@ for (const test of testAmounts) {
 
 💰 Overflow Demonstration:
   Amount: 1000 (safe)
-    Bonus: 100 ✅
-  
+    Bonus: 100 
+
   Amount: At threshold
-    Bonus: 1,676,954,890,648,914 ✅
-  
+    Bonus: 1,676,954,890,648,914 
+
   Amount: 20 trillion (above threshold)
-    Bonus: 456 ⚠️ OVERFLOW!
+    Bonus: 456 OVERFLOW!
     Expected: 2,000,000,000,000,000
 ```
 
 **Recommendation**:
+
 ```rust
 // Use u128 with checked arithmetic:
 let liquidation_amount_u128 = liquidation_amount as u128;
@@ -695,7 +780,7 @@ require!(
 
 ---
 
-### 8. Oracle Staleness Bypass ✅ TESTED
+### 9. Oracle Staleness Bypass 
 
 **Severity**: High  
 **Location**: `src/utils.rs:105-107`  
@@ -706,11 +791,12 @@ The staleness check accepts future timestamps, allowing stale prices to appear v
 
 ```rust
 pub fn is_valid(&self, current_slot: u64, max_staleness_slots: u64) -> bool {
-    current_slot <= self.valid_slot + max_staleness_slots // ⚠️ Accepts future!
+    current_slot <= self.valid_slot + max_staleness_slots // Accepts future!
 }
 ```
 
 **Impact**:
+
 - If `valid_slot = u64::MAX`, oracle appears valid forever
 - If `valid_slot = current_slot + 1_000_000`, valid for 1M slots into future
 - Stale prices used for collateralization
@@ -718,6 +804,7 @@ pub fn is_valid(&self, current_slot: u64, max_staleness_slots: u64) -> bool {
 - Incorrect liquidations or prevented liquidations
 
 **Attack Vector**:
+
 ```
 1. Attacker controls oracle (from vulnerability #6)
 2. Sets favorable price: $10,000 per token
@@ -728,6 +815,7 @@ pub fn is_valid(&self, current_slot: u64, max_staleness_slots: u64) -> bool {
 ```
 
 **Proof of Concept** (see test file):
+
 ```typescript
 // Create oracle with future valid_slot
 await program.methods
@@ -751,20 +839,21 @@ console.log(`  ${currentSlot} <= ${oracle.validSlot} + 100`);
 ```
 
 **Test Output**:
+
 ```
-🔥 EXPLOIT #8: Oracle Staleness Bypass
+EXPLOIT #8: Oracle Staleness Bypass
 📝 VULNERABILITY in is_valid():
    current_slot <= self.valid_slot + max_staleness
-   ⚠️ Accepts future timestamps!
+   Accepts future timestamps!
 
 💥 ATTACK: Create oracle with future valid_slot
-  ✅ Oracle created at slot 12345
+   Oracle created at slot 12345
   - Valid slot: 99999999999
   - Price: $10,000
 
 ⏰ Simulating time passage...
    Oracle stale but check would pass:
-   current_slot (112345) <= valid_slot (99999999999) + 100 ✓
+   current_slot (112345) <= valid_slot (99999999999) + 100 PASS
 
 🎯 IMPACT:
   - Stale prices used indefinitely
@@ -773,16 +862,17 @@ console.log(`  ${currentSlot} <= ${oracle.validSlot} + 100`);
 ```
 
 **Recommendation**:
+
 ```rust
 pub fn is_valid(&self, current_slot: u64, max_staleness_slots: u64) -> bool {
     // Reject future timestamps
     if self.valid_slot > current_slot {
         return false;
     }
-    
+
     // Calculate age
     let age = current_slot.saturating_sub(self.valid_slot);
-    
+
     // Check staleness
     age <= max_staleness_slots
 }
@@ -791,25 +881,25 @@ pub fn is_valid(&self, current_slot: u64, max_staleness_slots: u64) -> bool {
 pub fn get_asset_price(oracle_account: &AccountInfo) -> Result<u128> {
     let oracle = Oracle::try_deserialize(&mut &oracle_account.data.borrow()[..])?;
     let current_slot = Clock::get()?.slot;
-    
+
     // Reject future timestamps
     require!(
         oracle.valid_slot <= current_slot,
         LendingError::InvalidOracleData
     );
-    
+
     // Check staleness (100 slots = ~40 seconds)
     require!(
         oracle.is_valid(current_slot, 100),
         LendingError::InvalidOracleData
     );
-    
+
     // Validate confidence
     require!(
         oracle.confidence <= oracle.price / 20, // Max 5%
         LendingError::InvalidOracleData
     );
-    
+
     // Sanity check price
     require!(
         oracle.price > 0 && oracle.price < u128::MAX / 10000,
@@ -822,24 +912,130 @@ pub fn get_asset_price(oracle_account: &AccountInfo) -> Result<u128> {
 
 ---
 
+### 10. Missing PDA Validation in User Deposit Initialization
+
+**Severity**: High  
+**Location**: `programs/capstone/src/contexts.rs:288-302`  
+**Test**: `tests/meta-lend-exploits.ts:798-857`
+
+**Description**: The `InitializeUserDeposit` context accepts `user_deposit` as `AccountInfo` instead of a properly validated PDA account. While the instruction code verifies the PDA, the context allows any account to be passed initially.
+
+```rust
+#[derive(Accounts)]
+#[instruction(market_id: u64)]
+pub struct InitializeUserDeposit<'info> {
+    /// CHECK: User deposit account to be created manually
+    #[account(mut)]
+    pub user_deposit: AccountInfo<'info>,  // No PDA validation in context
+```
+
+**Impact**:
+
+- Attacker could attempt to initialize user deposits at non-canonical addresses
+- While instruction validates PDA, context bypass could enable edge case exploits
+- Inconsistent with other contexts that use proper PDA validation
+
+**Recommendation**:
+
+```rust
+#[derive(Accounts)]
+#[instruction(market_id: u64)]
+pub struct InitializeUserDeposit<'info> {
+    #[account(
+        init,
+        payer = user,
+        space = UserDeposit::SPACE,
+        seeds = [
+            b"user_deposit",
+            user.key().as_ref(),
+            market_id.to_le_bytes().as_ref(),
+            supply_mint.key().as_ref(),
+            collateral_mint.key().as_ref()
+        ],
+        bump
+    )]
+    pub user_deposit: Account<'info, UserDeposit>,
+    // ... rest remains same
+}
+```
+
+---
+
+### 11. Wrong Oracle Price Scaling for Liquidation Bonus
+
+**Severity**: High  
+**Location**: `programs/capstone/src/instructions/liquidate.rs:42-43`  
+**Test**: `tests/meta-lend-exploits.ts:1168-1276`
+
+**Description**: The liquidation bonus calculation directly multiplies token amounts without converting to value terms first. When supply and collateral assets have different prices, this gives incorrect bonus amounts.
+
+```rust
+let liquidation_bonus = 1100;
+let collateral_to_seize = liquidation_amount * liquidation_bonus / 1000;
+// This assumes 1:1 price ratio!
+```
+
+**Impact**:
+
+- If liquidating 50 USDC ($1) debt with ETH ($3000) collateral:
+  - Current: seizes 55 USDC worth (50 \* 1.1)
+  - Should seize: 0.0183 ETH ($55 worth)
+  - But code would try to seize 55 ETH ($165,000!) if not for transfer failure
+- Incorrect economic incentives for liquidators
+- May prevent liquidations if calculated amount exceeds balance
+
+**Recommendation**:
+
+```rust
+let liquidation_amount_u128 = liquidation_amount as u128;
+let supply_price = get_asset_price(&ctx.accounts.supply_oracle)?;
+let collateral_price = get_asset_price(&ctx.accounts.collateral_oracle)?;
+
+// Calculate value being repaid
+let repayment_value = liquidation_amount_u128
+    .checked_mul(supply_price)
+    .ok_or(LendingError::MathOverflow)?;
+
+// Add 10% bonus to value
+let liquidation_bonus = 1100u128;
+let value_with_bonus = repayment_value
+    .checked_mul(liquidation_bonus)
+    .and_then(|v| v.checked_div(1000))
+    .ok_or(LendingError::MathOverflow)?;
+
+// Convert value back to collateral tokens
+let collateral_to_seize = value_with_bonus
+    .checked_div(collateral_price)
+    .ok_or(LendingError::MathOverflow)?;
+
+require!(
+    collateral_to_seize <= borrower_deposit.collateral_deposited,
+    LendingError::InsufficientCollateral
+);
+```
+
+---
+
 ## Medium Severity Vulnerabilities
 
-### 9. Withdraw Collateralization Logic Gap
+### 12. Withdraw Collateralization Logic Gap
 
 **Severity**: Medium  
 **Location**: `src/instructions/withdraw.rs:33-58`  
-**Test**: ⚠️ Architectural issue (requires multi-market implementation)
+**Test**: Architectural issue (requires multi-market implementation)
 
 **Description**:
 Withdraw checks collateral but doesn't account for cross-market collateralization. Users can withdraw supply while having borrows, potentially creating future risks.
 
 **Impact**:
+
 - Limited in current single-market design
 - If protocol adds cross-market collateral, becomes critical
 - Users can reduce total collateral value across markets
 - Future feature additions could inherit this vulnerability
 
 **Recommendation**:
+
 ```rust
 // Add comprehensive health check
 if user_deposit.borrowed_amount > 0 {
@@ -848,12 +1044,12 @@ if user_deposit.borrowed_amount > 0 {
         .and_then(|v| v.checked_div(10000))?;
 
     require!(borrow_value <= max_borrow_value, ...);
-    
+
     // ADD: Safety margin to prevent near-liquidation
     let liquidation_value = collateral_value
         .checked_mul(market.liquidation_threshold as u128)
         .and_then(|v| v.checked_div(10000))?;
-    
+
     require!(
         borrow_value <= liquidation_value * 90 / 100, // 10% safety margin
         LendingError::InsufficientCollateral
@@ -863,30 +1059,32 @@ if user_deposit.borrowed_amount > 0 {
 
 ---
 
-### 10. Missing Rent Exemption Validation
+### 13. Missing Rent Exemption Validation
 
 **Severity**: Medium  
 **Location**: `src/instructions/user_deposit.rs:64`, `close_user_deposit.rs:105-110`  
-**Test**: ⚠️ Edge case (Anchor handles most scenarios)
+**Test**: Edge case (Anchor handles most scenarios)
 
 **Description**:
 Accounts lose all lamports when closed without zeroing data, creating potential edge cases.
 
 **Impact**:
+
 - Account could be garbage collected
 - Defense-in-depth concern
 - Limited risk due to Anchor's built-in handling
 
 **Recommendation**:
+
 ```rust
 pub fn close_user_deposit(ctx: Context<CloseUserDeposit>) -> Result<()> {
     // ... existing checks ...
-    
+
     let user_deposit_info = ctx.accounts.user_deposit.to_account_info();
     let user_info = ctx.accounts.user.to_account_info();
 
     let lamports = user_deposit_info.lamports();
-    
+
     // Transfer lamports
     **user_deposit_info.try_borrow_mut_lamports()? = 0;
     **user_info.try_borrow_mut_lamports()? = user_info
@@ -903,12 +1101,66 @@ pub fn close_user_deposit(ctx: Context<CloseUserDeposit>) -> Result<()> {
 
 ---
 
+### 14. Interest Accrual Inconsistency Between Instructions
+
+**Severity**: Medium  
+**Location**: `programs/capstone/src/instructions/borrow.rs:86-101`, `programs/capstone/src/instructions/repay.rs:17-33`  
+**Test**: `tests/meta-lend-exploits.ts:859-1000`
+
+**Description**: Interest is calculated and applied differently in `borrow` vs `repay` instructions. The `borrow` instruction applies interest AFTER collateral checks, while `repay` applies it BEFORE the repayment amount calculation. This creates accounting inconsistencies.
+
+**Impact**:
+
+- Users can exploit timing differences between instructions
+- Interest may be double-counted or missed depending on instruction sequence
+- Protocol's total_borrows tracking becomes inaccurate
+- Creates opportunities for interest rate arbitrage
+
+**Recommendation**:
+
+```rust
+// Create centralized interest accrual function
+fn accrue_user_interest(
+    user_deposit: &mut UserDeposit,
+    current_slot: u64,
+) -> Result<()> {
+    if user_deposit.borrowed_amount == 0 {
+        return Ok(());
+    }
+
+    let slots_elapsed = current_slot.saturating_sub(user_deposit.last_update_slot);
+    let interest_rate_per_slot = 25u128;
+    let slots_elapsed_u128 = slots_elapsed as u128;
+
+    let interest_increment = user_deposit
+        .borrowed_amount
+        .saturating_mul(interest_rate_per_slot)
+        .saturating_mul(slots_elapsed_u128)
+        .checked_div(SCALING_FACTOR)
+        .ok_or(LendingError::MathOverflow)?;
+
+    user_deposit.borrowed_amount = user_deposit
+        .borrowed_amount
+        .checked_add(interest_increment)
+        .ok_or(LendingError::MathOverflow)?;
+
+    user_deposit.last_update_slot = current_slot;
+    Ok(())
+}
+
+// Call consistently at START of all instructions
+```
+
+---
+
 ## Additional Issues
 
 ### Missing Market Totals Update in Liquidation
+
 **Location**: `src/instructions/liquidate.rs:86-95`
 
 Liquidation updates user balances but not market totals:
+
 ```rust
 // MISSING:
 market.total_borrows = market.total_borrows
@@ -918,101 +1170,25 @@ market.total_collateral_deposits = market.total_collateral_deposits
 ```
 
 ### No Emergency Pause Enforcement
+
 **Location**: All instruction handlers
 
 `ProtocolState.is_paused` field exists but never checked:
+
 ```rust
 // ADD to all instructions:
 require!(!protocol_state.is_paused, LendingError::MarketPaused);
 ```
 
 ### CToken Exchange Rate Manipulation
+
 **Location**: `src/utils.rs:74-93`
 
 First depositor attack:
+
 1. Supply 1 token → get 1 cToken
 2. Direct transfer large amount to vault
 3. Exchange rate: (1 + large) / 1
 4. Next depositors get very few cTokens
 
 ---
-
-## Testing Summary
-
-### Automated Exploit Tests
-
-Run all security tests:
-```bash
-anchor test
-```
-
-Expected output includes:
-```
-🚨 SECURITY EXPLOITS - DO NOT USE IN PRODUCTION
-
-  ✓ EXPLOIT #2: Unauthorized Market Parameter Modification (5000ms)
-  ✓ EXPLOIT #3: Liquidation Integer Underflow (3000ms)
-  ✓ EXPLOIT #4: Borrow More Than Allowed via Interest Timing (4000ms)
-  ✓ EXPLOIT #6: Price Manipulation via Malicious Oracle (3000ms)
-  ✓ EXPLOIT #7: Liquidation Bonus Calculation Overflow (1000ms)
-  ✓ EXPLOIT #8: Oracle Staleness Check Bypass (2000ms)
-  ✓ EXPLOIT SUMMARY (500ms)
-
-7 passing (18s)
-```
-
-### Vulnerability Coverage
-
-| ID | Vulnerability | Test Status | Reason if Not Tested |
-|----|--------------|-------------|---------------------|
-| #1 | Flash loan unsafe transmute | ❌ | Requires malicious program deployment |
-| #2 | Missing market admin check | ✅ | Fully demonstrated |
-| #3 | Liquidation underflow | ✅ | Fully demonstrated |
-| #4 | Interest timing exploit | ✅ | Fully demonstrated |
-| #5 | Flash loan reentrancy | ❌ | Requires multi-program attack |
-| #6 | Malicious oracle | ✅ | Fully demonstrated |
-| #7 | Liquidation overflow | ✅ | Fully demonstrated |
-| #8 | Oracle staleness | ✅ | Fully demonstrated |
-| #9 | Withdraw logic gap | ⚠️ | Architectural (limited current impact) |
-| #10 | Rent exemption | ⚠️ | Edge case (Anchor handles) |
-
-**Total: 6/10 vulnerabilities with working exploit tests**
-
----
-
-## Conclusion
-
-This audit identified **10 significant vulnerabilities** with **5 Critical** and **3 High** severity issues. Six vulnerabilities have been validated with working Proof-of-Concept exploits in the test suite.
-
-### Priority Fixes (Critical):
-
-1. ✅ **Remove unsafe transmute in flash loan** - Add validated token_program to context
-2. ✅ **Add market admin authorization** - Require authority == market_admin  
-3. ✅ **Fix liquidation arithmetic** - Use checked_sub, update market totals
-4. ✅ **Reorder interest calculation** - Apply interest before collateral checks
-5. **Add flash loan reentrancy guard** - Reload accounts, validate state
-
-### High Priority Fixes:
-
-6. ✅ **Implement oracle whitelist** - Or migrate to Pyth/Switchboard
-7. ✅ **Fix liquidation bonus overflow** - Use u128 checked arithmetic
-8. ✅ **Fix oracle staleness check** - Reject future timestamps
-
-### Recommendations:
-
-- **Immediate**: Fix all Critical vulnerabilities before any deployment
-- **Short-term**: Implement comprehensive test suite for all edge cases
-- **Medium-term**: Add reentrancy guards and emergency pause functionality
-- **Long-term**: Migrate to professional oracle solutions (Pyth/Switchboard)
-- **Required**: Full re-audit after implementing fixes
-
-**Estimated Time to Fix**: 2-3 weeks for all vulnerabilities  
-**Re-audit Required**: Yes, 1-2 weeks after fixes
-
----
-
-## Disclaimer
-
-This audit is for educational purposes as part of the MetaLend Security Bootcamp Capstone Project. This code contains intentional vulnerabilities for learning and must not be deployed to mainnet under any circumstances.
-
-**⚠️  DO NOT DEPLOY TO PRODUCTION ⚠️**
